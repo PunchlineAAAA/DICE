@@ -426,6 +426,224 @@ class LLM2Vec(nn.Module):
             else f"!@#$%^&*(){text}"
         )
 
+    def _chunk_text(
+        self,
+        text: str,
+        chunk_size: int,
+        chunk_overlap: int,
+        disable_chunking_for_short_docs: bool = False,
+    ) -> List[str]:
+        if chunk_size <= 0:
+            return [text]
+        if chunk_overlap >= chunk_size:
+            raise ValueError("chunk_overlap must be smaller than chunk_size")
+
+        token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        if not token_ids:
+            return [text]
+
+        if disable_chunking_for_short_docs and len(token_ids) <= chunk_size:
+            return [text]
+
+        step = chunk_size - chunk_overlap
+        chunks = []
+        for start in range(0, len(token_ids), step):
+            chunk_ids = token_ids[start : start + chunk_size]
+            if not chunk_ids:
+                continue
+            chunk_text = self.tokenizer.decode(
+                chunk_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True,
+            ).strip()
+            if chunk_text:
+                chunks.append(chunk_text)
+            if start + chunk_size >= len(token_ids):
+                break
+        return chunks or [text]
+
+    def _aggregate_chunk_embeddings(
+        self,
+        chunk_embeddings: torch.Tensor,
+        agg_mode: str = "mean",
+        top_k: int = 3,
+        softmax_temperature: float = 1.0,
+    ) -> torch.Tensor:
+        if chunk_embeddings.ndim != 2:
+            raise ValueError(
+                "chunk_embeddings should be rank-2: [num_chunks, hidden_dim], "
+                f"got shape {tuple(chunk_embeddings.shape)}"
+            )
+
+        if chunk_embeddings.shape[0] == 1:
+            return chunk_embeddings[0]
+
+        if agg_mode == "mean":
+            return chunk_embeddings.mean(dim=0)
+        if agg_mode == "max":
+            return chunk_embeddings.max(dim=0).values
+
+        chunk_norms = torch.linalg.norm(chunk_embeddings, dim=-1)
+        if agg_mode == "norm_topk_mean":
+            k = min(max(1, int(top_k)), chunk_embeddings.shape[0])
+            topk_idx = torch.topk(chunk_norms, k=k, largest=True).indices
+            return chunk_embeddings[topk_idx].mean(dim=0)
+
+        if agg_mode == "norm_softmax_mean":
+            temperature = max(float(softmax_temperature), 1e-6)
+            weights = torch.softmax(chunk_norms / temperature, dim=0)
+            return (chunk_embeddings * weights.unsqueeze(-1)).sum(dim=0)
+
+        raise ValueError(f"Unknown agg_mode: {agg_mode}")
+
+    def encode_text_list(
+        self,
+        texts: List[str],
+        batch_size: int = 32,
+        instruction: str = "",
+        show_progress_bar: bool = False,
+        device: Optional[str] = None,
+    ) -> torch.Tensor:
+        pairs = [[instruction, text] for text in texts]
+        embeddings = self.encode(
+            pairs,
+            batch_size=batch_size,
+            show_progress_bar=show_progress_bar,
+            convert_to_tensor=True,
+            device=device,
+        )
+        if not isinstance(embeddings, torch.Tensor):
+            embeddings = torch.as_tensor(embeddings)
+        return embeddings.to(torch.float32)
+
+    def encode_documents_with_chunk_agg(
+        self,
+        texts: List[str],
+        batch_size: int = 32,
+        chunk_size: int = 0,
+        chunk_overlap: int = 0,
+        agg_mode: str = "mean",
+        top_k: int = 3,
+        softmax_temperature: float = 1.0,
+        disable_chunking_for_short_docs: bool = False,
+        instruction: str = "",
+        show_progress_bar: bool = False,
+        device: Optional[str] = None,
+    ) -> torch.Tensor:
+        if chunk_size <= 0:
+            return self.encode_text_list(
+                texts=texts,
+                batch_size=batch_size,
+                instruction=instruction,
+                show_progress_bar=show_progress_bar,
+                device=device,
+            )
+
+        all_chunks = []
+        doc_spans = []
+        cursor = 0
+        for text in texts:
+            chunks = self._chunk_text(
+                text,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                disable_chunking_for_short_docs=disable_chunking_for_short_docs,
+            )
+            doc_spans.append((cursor, cursor + len(chunks)))
+            cursor += len(chunks)
+            all_chunks.extend(chunks)
+
+        chunk_embeddings = self.encode_text_list(
+            texts=all_chunks,
+            batch_size=batch_size,
+            instruction=instruction,
+            show_progress_bar=show_progress_bar,
+            device=device,
+        )
+
+        aggregated_embeddings = []
+        for start, end in doc_spans:
+            aggregated_embeddings.append(
+                self._aggregate_chunk_embeddings(
+                    chunk_embeddings[start:end],
+                    agg_mode=agg_mode,
+                    top_k=top_k,
+                    softmax_temperature=softmax_temperature,
+                )
+            )
+        return torch.stack(aggregated_embeddings, dim=0).to(torch.float32)
+
+    def forward_text_list(
+        self,
+        texts: List[str],
+        instruction: str = "",
+        device: Optional[str] = None,
+    ) -> torch.Tensor:
+        if device is None:
+            device = str(next(self.parameters()).device)
+
+        combined_texts = [
+            self.prepare_for_tokenization(self._convert_to_str(instruction, text))
+            for text in texts
+        ]
+        features = self.tokenize(combined_texts)
+        features = batch_to_device(features, device)
+        return self.forward(features)
+
+    def forward_documents_with_chunk_agg(
+        self,
+        texts: List[str],
+        chunk_size: int = 0,
+        chunk_overlap: int = 0,
+        agg_mode: str = "mean",
+        top_k: int = 3,
+        softmax_temperature: float = 1.0,
+        disable_chunking_for_short_docs: bool = False,
+        instruction: str = "",
+        device: Optional[str] = None,
+    ) -> torch.Tensor:
+        if device is None:
+            device = str(next(self.parameters()).device)
+
+        if chunk_size <= 0:
+            return self.forward_text_list(
+                texts=texts,
+                instruction=instruction,
+                device=device,
+            )
+
+        all_chunks = []
+        doc_spans = []
+        cursor = 0
+        for text in texts:
+            chunks = self._chunk_text(
+                text,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                disable_chunking_for_short_docs=disable_chunking_for_short_docs,
+            )
+            doc_spans.append((cursor, cursor + len(chunks)))
+            cursor += len(chunks)
+            all_chunks.extend(chunks)
+
+        chunk_embeddings = self.forward_text_list(
+            texts=all_chunks,
+            instruction=instruction,
+            device=device,
+        )
+
+        aggregated_embeddings = []
+        for start, end in doc_spans:
+            aggregated_embeddings.append(
+                self._aggregate_chunk_embeddings(
+                    chunk_embeddings[start:end],
+                    agg_mode=agg_mode,
+                    top_k=top_k,
+                    softmax_temperature=softmax_temperature,
+                )
+            )
+        return torch.stack(aggregated_embeddings, dim=0)
+
     def encode(
         self,
         sentences: Union[str, List[str]],
@@ -476,8 +694,13 @@ class LLM2Vec(nn.Module):
         length_sorted_idx = np.argsort([-self._text_length(sen) for sen in sentences])
         sentences_sorted = [sentences[idx] for idx in length_sorted_idx]
         all_embeddings = []
+        use_local_device_only = (
+            torch.distributed.is_initialized()
+            or (isinstance(device, str) and device.startswith("cuda:"))
+            or (device != "cuda")
+        )
 
-        if torch.cuda.device_count() <= 1:
+        if torch.cuda.device_count() <= 1 or use_local_device_only:
             # This branch also support mps devices
             self.to(device)
             for start_index in trange(
