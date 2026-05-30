@@ -91,20 +91,13 @@ torchrun --nproc_per_node=4 experiments/run_supervised.py train_configs/supervis
 
 You can adapt configs under `train_configs/` for Dream, Llama, Mistral, Qwen, and related settings.
 
-## Package Notes
-
-This repository currently exposes the Python package name `llm2vec` through `setup.py`. The repository name is `DICE-Embedding`, but the import path remains:
-
-```python
-from llm2vec import LLM2Vec
-```
-
 ## Acknowledgment
 
 This codebase builds on ideas and implementations from:
 
 - [LLM2Vec](https://github.com/McGill-NLP/llm2vec/)
 - [Dream](https://github.com/HKUNLP/Dream)
+- [DiffEmbed](https://github.com/siyue-zhang/DiffEmbed)
 
 ## Citation
 
