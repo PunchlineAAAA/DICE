@@ -369,7 +369,7 @@ def load_llm2vec():
             from llm2vec import LLM2Vec
         except ImportError:
             raise ImportError(
-                "Could not import `llm2vec`. Run `pip install -e .` from the DiffEmbed root first."
+                "Could not import `llm2vec`. Run `pip install -e .` from the repository root first."
             ) from exc
     return LLM2Vec
 
