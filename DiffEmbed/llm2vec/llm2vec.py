@@ -80,6 +80,7 @@ class LLM2Vec(nn.Module):
         self.max_length = max_length
         self.doc_max_length = doc_max_length
         self.config = model.config
+        self.use_safe_multi_process = False
 
     @classmethod
     def _get_model_class(cls, config_class_name, enable_bidirectional):
@@ -251,32 +252,42 @@ class LLM2Vec(nn.Module):
     
 
     def prepare_for_tokenization(self, text):
-        if self.model.config._name_or_path == "meta-llama/Meta-Llama-3-8B-Instruct":
+        model_name_or_path = str(self.model.config._name_or_path).rstrip("/")
+        model_leaf = model_name_or_path.split("/")[-1]
+        if (
+            model_name_or_path == "meta-llama/Meta-Llama-3-8B-Instruct"
+            or model_leaf == "Meta-Llama-3-8B-Instruct"
+        ):
             text = (
                 "<|start_header_id|>user<|end_header_id|>\n\n"
                 + text.strip()
                 + "<|eot_id|>"
             )
             return text
-        if self.model.config._name_or_path in [
+        if model_name_or_path in [
             "mistralai/Mistral-7B-Instruct-v0.2",
             "meta-llama/Llama-2-7b-chat-hf",
-        ]:
+        ] or model_leaf in {"Mistral-7B-Instruct-v0.2", "Llama-2-7b-chat-hf"}:
             text = "[INST] " + text.strip() + " [/INST]"
-        if self.model.config._name_or_path in [
+        if model_name_or_path in [
             "google/gemma-2-9b-it",
-        ]:
+        ] or model_leaf == "gemma-2-9b-it":
             text = "<bos><start_of_turn>user\n" + text.strip() + "<end_of_turn>"
-        if self.model.config._name_or_path in [
+        if model_name_or_path in [
             "Qwen/Qwen2-1.5B-Instruct",
             "Qwen/Qwen2-7B-Instruct",
-        ]:
+            "Qwen/Qwen2.5-7B-Instruct",
+        ] or model_leaf in {
+            "Qwen2-1.5B-Instruct",
+            "Qwen2-7B-Instruct",
+            "Qwen2.5-7B-Instruct",
+        }:
             text = "<|im_start|>user\n" + text.strip() + "<|im_end|>"
         ##
-        if self.model.config._name_or_path in [
+        if model_name_or_path in [
             "Dream-org/Dream-v0-Instruct-7B",
             "siyue/Dream_emb",
-        ]:
+        ] or model_leaf in {"Dream-v0-Instruct-7B", "Dream_emb"}:
             text = "<|im_start|>user\n" + text.strip() + "<|im_end|>"
         ##
         if self.pooling_mode == "eos_token":
@@ -376,6 +387,13 @@ class LLM2Vec(nn.Module):
                 ],
                 dim=0,
             )
+        elif self.pooling_mode == "masked_mean":
+            mask = features.get("embed_mask", features["attention_mask"]).to(
+                last_hidden_states.device
+            )
+            mask = mask.to(last_hidden_states.dtype)
+            mask_sum = mask.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            return torch.sum(last_hidden_states * mask.unsqueeze(-1), dim=1) / mask_sum
         elif self.pooling_mode == "weighted_mean":
             bs, l, _ = last_hidden_states.shape
             complete_weights = torch.zeros(bs, l, device=last_hidden_states.device)
@@ -462,6 +480,295 @@ class LLM2Vec(nn.Module):
                 break
         return chunks or [text]
 
+    def _chunk_token_ids_with_offsets(
+        self,
+        text: str,
+        chunk_size: int,
+        chunk_overlap: int,
+        disable_chunking_for_short_docs: bool = False,
+    ) -> List[tuple[List[int], int]]:
+        if chunk_size <= 0:
+            return [(self.tokenizer.encode(text, add_special_tokens=False), 0)]
+        if chunk_overlap >= chunk_size:
+            raise ValueError("chunk_overlap must be smaller than chunk_size")
+
+        token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        if not token_ids:
+            return [([], 0)]
+
+        if disable_chunking_for_short_docs and len(token_ids) <= chunk_size:
+            return [(token_ids, 0)]
+
+        step = chunk_size - chunk_overlap
+        chunks = []
+        for start in range(0, len(token_ids), step):
+            chunk_ids = token_ids[start : start + chunk_size]
+            if chunk_ids:
+                chunks.append((chunk_ids, start))
+            if start + chunk_size >= len(token_ids):
+                break
+        return chunks or [(token_ids, 0)]
+
+    def _chunk_text_with_offsets(
+        self,
+        text: str,
+        chunk_size: int,
+        chunk_overlap: int,
+        disable_chunking_for_short_docs: bool = False,
+    ) -> List[tuple[str, int]]:
+        chunks = []
+        for chunk_ids, start in self._chunk_token_ids_with_offsets(
+            text,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            disable_chunking_for_short_docs=disable_chunking_for_short_docs,
+        ):
+            if not chunk_ids:
+                continue
+            chunk_text = self.tokenizer.decode(
+                chunk_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True,
+            ).strip()
+            if chunk_text:
+                chunks.append((chunk_text, start))
+        return chunks or [(text, 0)]
+
+    def _chunk_token_ids(
+        self,
+        text: str,
+        chunk_size: int,
+        chunk_overlap: int,
+        disable_chunking_for_short_docs: bool = False,
+    ) -> List[List[int]]:
+        if chunk_size <= 0:
+            return [self.tokenizer.encode(text, add_special_tokens=False)]
+        if chunk_overlap >= chunk_size:
+            raise ValueError("chunk_overlap must be smaller than chunk_size")
+
+        token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        if not token_ids:
+            return [[]]
+
+        if disable_chunking_for_short_docs and len(token_ids) <= chunk_size:
+            return [token_ids]
+
+        step = chunk_size - chunk_overlap
+        chunks = []
+        for start in range(0, len(token_ids), step):
+            chunk_ids = token_ids[start : start + chunk_size]
+            if chunk_ids:
+                chunks.append(chunk_ids)
+            if start + chunk_size >= len(token_ids):
+                break
+        return chunks or [token_ids]
+
+    def _get_prompt_template_token_ids(self, instruction: str = "") -> tuple[List[int], List[int]]:
+        marker = "!@#$%^&*()"
+        templated = self.prepare_for_tokenization(
+            f"{instruction.strip()} {marker}".strip() if instruction else marker
+        )
+        if marker not in templated:
+            return [], []
+        prefix_text, suffix_text = templated.split(marker, 1)
+        prefix_ids = (
+            self.tokenizer.encode(prefix_text, add_special_tokens=True)
+            if prefix_text
+            else []
+        )
+        suffix_ids = (
+            self.tokenizer.encode(suffix_text, add_special_tokens=False)
+            if suffix_text
+            else []
+        )
+        return prefix_ids, suffix_ids
+
+    def _make_token_chunk_features(
+        self,
+        chunk_ids: List[int],
+        position_offset: Optional[int],
+        prefix_ids: List[int],
+        suffix_ids: List[int],
+    ) -> tuple[List[int], List[int]]:
+        available_chunk_len = self.max_length - len(prefix_ids) - len(suffix_ids)
+        if available_chunk_len <= 0:
+            raise ValueError("Prompt template is longer than max_length")
+        chunk_ids = list(chunk_ids[:available_chunk_len])
+        input_ids = list(prefix_ids) + chunk_ids + list(suffix_ids)
+
+        if position_offset is None:
+            position_ids = list(range(len(input_ids)))
+        else:
+            prefix_len = len(prefix_ids)
+            chunk_len = len(chunk_ids)
+            suffix_len = len(suffix_ids)
+            offset = int(position_offset)
+            max_position = getattr(self.model.config, "max_position_embeddings", None)
+            if max_position is not None:
+                max_chunk_start = int(max_position) - chunk_len - suffix_len
+                offset = min(offset, max(0, max_chunk_start))
+            prefix_start = max(0, offset - prefix_len)
+            prefix_positions = list(range(prefix_start, prefix_start + prefix_len))
+            chunk_positions = list(range(offset, offset + chunk_len))
+            suffix_start = offset + chunk_len
+            suffix_positions = list(range(suffix_start, suffix_start + suffix_len))
+            position_ids = prefix_positions + chunk_positions + suffix_positions
+
+        return input_ids, position_ids
+
+    def _encode_token_id_chunks(
+        self,
+        token_chunks: List[List[int]],
+        position_offsets: Optional[List[int]] = None,
+        batch_size: int = 32,
+        device: Optional[str] = None,
+        show_progress_bar: bool = False,
+    ) -> torch.Tensor:
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else str(next(self.parameters()).device)
+        if position_offsets is not None and len(position_offsets) != len(token_chunks):
+            raise ValueError("position_offsets length must match token_chunks length")
+
+        prefix_ids, suffix_ids = self._get_prompt_template_token_ids()
+        length_sorted_idx = np.argsort(
+            [-(len(chunk) + len(prefix_ids) + len(suffix_ids)) for chunk in token_chunks]
+        )
+        token_chunks_sorted = [token_chunks[idx] for idx in length_sorted_idx]
+        offsets_sorted = (
+            None if position_offsets is None else [position_offsets[idx] for idx in length_sorted_idx]
+        )
+
+        self.to(device)
+        all_embeddings = []
+        for start in trange(
+            0,
+            len(token_chunks_sorted),
+            batch_size,
+            desc="Batches",
+            disable=not show_progress_bar,
+        ):
+            batch_chunks = token_chunks_sorted[start : start + batch_size]
+            batch_offsets = None if offsets_sorted is None else offsets_sorted[start : start + batch_size]
+            encoded = []
+            embed_mask_rows = []
+            position_id_rows = []
+            for item_idx, chunk_ids in enumerate(batch_chunks):
+                offset = None if batch_offsets is None else batch_offsets[item_idx]
+                ids, pos_ids = self._make_token_chunk_features(
+                    chunk_ids=chunk_ids,
+                    position_offset=offset,
+                    prefix_ids=prefix_ids,
+                    suffix_ids=suffix_ids,
+                )
+                chunk_token_count = len(ids) - len(prefix_ids) - len(suffix_ids)
+                if chunk_token_count < 0:
+                    raise ValueError("Token chunk prompt accounting produced a negative chunk length")
+                embed_mask = [0] * len(prefix_ids) + [1] * (chunk_token_count + len(suffix_ids))
+                encoded.append({"input_ids": ids, "attention_mask": [1] * len(ids)})
+                embed_mask_rows.append(embed_mask)
+                position_id_rows.append(pos_ids)
+
+            features = self.tokenizer.pad(encoded, padding=True, return_tensors="pt")
+            embed_mask = torch.zeros_like(features["attention_mask"])
+            for row_idx, row_mask in enumerate(embed_mask_rows):
+                row_len = len(row_mask)
+                if row_len:
+                    embed_mask[row_idx, -row_len:] = torch.tensor(row_mask, dtype=embed_mask.dtype)
+            features["embed_mask"] = embed_mask
+            if batch_offsets is not None:
+                position_ids = torch.zeros_like(features["input_ids"], dtype=torch.long)
+                for row_idx, pos_ids in enumerate(position_id_rows):
+                    row_len = len(pos_ids)
+                    position_ids[row_idx, -row_len:] = torch.tensor(pos_ids, dtype=torch.long)
+                features["position_ids"] = position_ids
+
+            features = batch_to_device(features, device)
+            with torch.no_grad():
+                embeddings = self.forward(features)
+                all_embeddings.append(embeddings.detach().cpu().to(torch.float32))
+
+        all_embeddings = torch.cat(all_embeddings, dim=0)
+        all_embeddings = all_embeddings[np.argsort(length_sorted_idx)]
+        return all_embeddings.to(torch.float32)
+
+    @staticmethod
+    def _resolve_chunk_position_offsets(
+        dice_position_mode: str,
+        chunk_offsets: List[int],
+    ) -> Optional[List[int]]:
+        if dice_position_mode == "reset":
+            return None
+        if dice_position_mode == "absolute_offset":
+            return chunk_offsets
+        raise ValueError(f"Unknown dice_position_mode: {dice_position_mode}")
+
+    def _get_landmark_token_id(self) -> int:
+        for attr in ("sep_token_id", "eos_token_id", "bos_token_id"):
+            token_id = getattr(self.tokenizer, attr, None)
+            if token_id is not None:
+                return int(token_id)
+        raise ValueError(
+            "LMK-like baseline requires a tokenizer with sep/eos/bos token id."
+        )
+
+    def _build_lmk_features(
+        self,
+        text: str,
+        instruction: str,
+        chunk_size: int,
+        chunk_overlap: int,
+        disable_chunking_for_short_docs: bool = False,
+    ) -> Dict[str, List[int]]:
+        chunk_token_ids = self._chunk_token_ids(
+            text,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            disable_chunking_for_short_docs=disable_chunking_for_short_docs,
+        )
+        prefix_ids, suffix_ids = self._get_prompt_template_token_ids(instruction)
+        landmark_id = self._get_landmark_token_id()
+        available_len = self.max_length - len(prefix_ids) - len(suffix_ids)
+        if available_len <= 0:
+            raise ValueError("Prompt template is longer than max_length")
+
+        body_ids: List[int] = []
+        landmark_positions: List[int] = []
+        for chunk_ids in chunk_token_ids:
+            required = len(chunk_ids) + 1  # chunk + landmark
+            if body_ids and len(body_ids) + required > available_len:
+                break
+            if not body_ids and required > available_len:
+                keep = max(available_len - 1, 0)
+                chunk_ids = chunk_ids[:keep]
+            if not chunk_ids and available_len <= 0:
+                break
+            body_ids.extend(chunk_ids)
+            if len(body_ids) < available_len:
+                landmark_positions.append(len(body_ids))
+                body_ids.append(landmark_id)
+            else:
+                break
+
+        if not landmark_positions:
+            body_ids = body_ids[: max(available_len - 1, 0)]
+            if available_len > 0:
+                landmark_positions.append(len(body_ids))
+                body_ids.append(landmark_id)
+
+        input_ids = prefix_ids + body_ids + suffix_ids
+        attention_mask = [1] * len(input_ids)
+        embed_mask = [0] * len(input_ids)
+        prefix_len = len(prefix_ids)
+        for pos in landmark_positions:
+            landmark_idx = prefix_len + pos
+            if 0 <= landmark_idx < len(embed_mask):
+                embed_mask[landmark_idx] = 1
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "embed_mask": embed_mask,
+        }
+
     def _aggregate_chunk_embeddings(
         self,
         chunk_embeddings: torch.Tensor,
@@ -526,6 +833,8 @@ class LLM2Vec(nn.Module):
         top_k: int = 3,
         softmax_temperature: float = 1.0,
         disable_chunking_for_short_docs: bool = False,
+        dice_position_mode: str = "reset",
+        dice_chunk_input_mode: str = "text",
         instruction: str = "",
         show_progress_bar: bool = False,
         device: Optional[str] = None,
@@ -539,27 +848,65 @@ class LLM2Vec(nn.Module):
                 device=device,
             )
 
-        all_chunks = []
-        doc_spans = []
-        cursor = 0
-        for text in texts:
-            chunks = self._chunk_text(
-                text,
+        if agg_mode == "lmk_mean":
+            return self.encode_documents_with_lmk_pool(
+                texts=texts,
+                batch_size=batch_size,
                 chunk_size=chunk_size,
                 chunk_overlap=chunk_overlap,
                 disable_chunking_for_short_docs=disable_chunking_for_short_docs,
+                instruction=instruction,
+                show_progress_bar=show_progress_bar,
+                device=device,
             )
+
+        all_chunks = []
+        chunk_offsets = []
+        doc_spans = []
+        cursor = 0
+        for text in texts:
+            if dice_chunk_input_mode == "text":
+                chunk_items = self._chunk_text_with_offsets(
+                    text,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    disable_chunking_for_short_docs=disable_chunking_for_short_docs,
+                )
+            elif dice_chunk_input_mode == "token_ids":
+                chunk_items = self._chunk_token_ids_with_offsets(
+                    text,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    disable_chunking_for_short_docs=disable_chunking_for_short_docs,
+                )
+            else:
+                raise ValueError(f"Unknown dice_chunk_input_mode: {dice_chunk_input_mode}")
+            chunks = [chunk for chunk, _ in chunk_items]
+            offsets = [offset for _, offset in chunk_items]
             doc_spans.append((cursor, cursor + len(chunks)))
             cursor += len(chunks)
             all_chunks.extend(chunks)
+            chunk_offsets.extend(offsets)
 
-        chunk_embeddings = self.encode_text_list(
-            texts=all_chunks,
-            batch_size=batch_size,
-            instruction=instruction,
-            show_progress_bar=show_progress_bar,
-            device=device,
-        )
+        position_offsets = self._resolve_chunk_position_offsets(dice_position_mode, chunk_offsets)
+        if dice_chunk_input_mode == "token_ids":
+            chunk_embeddings = self._encode_token_id_chunks(
+                token_chunks=all_chunks,
+                position_offsets=position_offsets,
+                batch_size=batch_size,
+                device=device,
+                show_progress_bar=show_progress_bar,
+            )
+        else:
+            if position_offsets is not None:
+                raise ValueError("absolute_offset currently requires dice_chunk_input_mode=token_ids")
+            chunk_embeddings = self.encode_text_list(
+                texts=all_chunks,
+                batch_size=batch_size,
+                instruction=instruction,
+                show_progress_bar=show_progress_bar,
+                device=device,
+            )
 
         aggregated_embeddings = []
         for start, end in doc_spans:
@@ -572,6 +919,75 @@ class LLM2Vec(nn.Module):
                 )
             )
         return torch.stack(aggregated_embeddings, dim=0).to(torch.float32)
+
+    def encode_documents_with_lmk_pool(
+        self,
+        texts: List[str],
+        batch_size: int = 32,
+        chunk_size: int = 512,
+        chunk_overlap: int = 0,
+        disable_chunking_for_short_docs: bool = False,
+        instruction: str = "",
+        show_progress_bar: bool = False,
+        device: Optional[str] = None,
+    ) -> torch.Tensor:
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        features_list = [
+            self._build_lmk_features(
+                text=text,
+                instruction=instruction,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                disable_chunking_for_short_docs=disable_chunking_for_short_docs,
+            )
+            for text in texts
+        ]
+
+        self.eval()
+        self.to(device)
+        all_embeddings = []
+        original_pooling_mode = self.pooling_mode
+        self.pooling_mode = "masked_mean"
+        try:
+            for start_index in trange(
+                0,
+                len(features_list),
+                batch_size,
+                desc="Batches",
+                disable=not show_progress_bar,
+            ):
+                batch_features = features_list[start_index : start_index + batch_size]
+                padded = self.tokenizer.pad(
+                    [
+                        {
+                            "input_ids": item["input_ids"],
+                            "attention_mask": item["attention_mask"],
+                        }
+                        for item in batch_features
+                    ],
+                    padding=True,
+                    return_tensors="pt",
+                )
+                embed_mask = torch.zeros_like(padded["attention_mask"])
+                for row_idx, item in enumerate(batch_features):
+                    row_mask = item["embed_mask"]
+                    row_len = len(row_mask)
+                    if row_len:
+                        embed_mask[row_idx, -row_len:] = torch.tensor(
+                            row_mask, dtype=embed_mask.dtype
+                        )
+                padded["embed_mask"] = embed_mask
+                padded = batch_to_device(padded, device)
+
+                with torch.no_grad():
+                    embeddings = self.forward(padded).detach().cpu().to(torch.float32)
+                all_embeddings.append(embeddings)
+        finally:
+            self.pooling_mode = original_pooling_mode
+
+        return torch.cat(all_embeddings, dim=0).to(torch.float32)
 
     def forward_text_list(
         self,
@@ -599,6 +1015,8 @@ class LLM2Vec(nn.Module):
         top_k: int = 3,
         softmax_temperature: float = 1.0,
         disable_chunking_for_short_docs: bool = False,
+        dice_position_mode: str = "reset",
+        dice_chunk_input_mode: str = "text",
         instruction: str = "",
         device: Optional[str] = None,
     ) -> torch.Tensor:
@@ -613,24 +1031,50 @@ class LLM2Vec(nn.Module):
             )
 
         all_chunks = []
+        chunk_offsets = []
         doc_spans = []
         cursor = 0
         for text in texts:
-            chunks = self._chunk_text(
-                text,
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
-                disable_chunking_for_short_docs=disable_chunking_for_short_docs,
-            )
+            if dice_chunk_input_mode == "text":
+                chunk_items = self._chunk_text_with_offsets(
+                    text,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    disable_chunking_for_short_docs=disable_chunking_for_short_docs,
+                )
+            elif dice_chunk_input_mode == "token_ids":
+                chunk_items = self._chunk_token_ids_with_offsets(
+                    text,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    disable_chunking_for_short_docs=disable_chunking_for_short_docs,
+                )
+            else:
+                raise ValueError(f"Unknown dice_chunk_input_mode: {dice_chunk_input_mode}")
+            chunks = [chunk for chunk, _ in chunk_items]
+            offsets = [offset for _, offset in chunk_items]
             doc_spans.append((cursor, cursor + len(chunks)))
             cursor += len(chunks)
             all_chunks.extend(chunks)
+            chunk_offsets.extend(offsets)
 
-        chunk_embeddings = self.forward_text_list(
-            texts=all_chunks,
-            instruction=instruction,
-            device=device,
-        )
+        position_offsets = self._resolve_chunk_position_offsets(dice_position_mode, chunk_offsets)
+        if dice_chunk_input_mode == "token_ids":
+            chunk_embeddings = self._encode_token_id_chunks(
+                token_chunks=all_chunks,
+                position_offsets=position_offsets,
+                batch_size=len(all_chunks) if all_chunks else 1,
+                device=device,
+                show_progress_bar=False,
+            )
+        else:
+            if position_offsets is not None:
+                raise ValueError("absolute_offset currently requires dice_chunk_input_mode=token_ids")
+            chunk_embeddings = self.forward_text_list(
+                texts=all_chunks,
+                instruction=instruction,
+                device=device,
+            )
 
         aggregated_embeddings = []
         for start, end in doc_spans:
@@ -731,21 +1175,50 @@ class LLM2Vec(nn.Module):
                     desc="Batches",
                     disable=not show_progress_bar,
                 )
-                results = []
+                if self.use_safe_multi_process:
+                    pending_results = []
+                    max_pending = max(1, num_proc * 2)
 
-                def update(*args):
-                    progress_bar.update()
-
-                for batch in sentences_batches:
-                    results.append(
-                        p.apply_async(
-                            self._encode,
-                            args=(batch, None, convert_to_numpy, True),
-                            callback=update,
+                    for batch in sentences_batches:
+                        pending_results.append(
+                            p.apply_async(
+                                self._encode,
+                                args=(batch, None, True, True),
+                            )
                         )
-                    )
+                        if len(pending_results) >= max_pending:
+                            result = pending_results.pop(0).get()
+                            if isinstance(result, np.ndarray):
+                                result = torch.from_numpy(result)
+                            elif not isinstance(result, torch.Tensor):
+                                result = torch.as_tensor(result)
+                            all_embeddings.append(result)
+                            progress_bar.update()
 
-                all_embeddings = [result.get() for result in results]
+                    while pending_results:
+                        result = pending_results.pop(0).get()
+                        if isinstance(result, np.ndarray):
+                            result = torch.from_numpy(result)
+                        elif not isinstance(result, torch.Tensor):
+                            result = torch.as_tensor(result)
+                        all_embeddings.append(result)
+                        progress_bar.update()
+                else:
+                    results = []
+
+                    def update(*args):
+                        progress_bar.update()
+
+                    for batch in sentences_batches:
+                        results.append(
+                            p.apply_async(
+                                self._encode,
+                                args=(batch, None, convert_to_numpy, True),
+                                callback=update,
+                            )
+                        )
+
+                    all_embeddings = [result.get() for result in results]
                 progress_bar.close()
 
         all_embeddings = torch.cat(all_embeddings, dim=0)
@@ -803,8 +1276,10 @@ class LLM2Vec(nn.Module):
                 import torch.nn.functional as F
                 embeddings = F.normalize(embeddings, p=2, dim=-1)
             embeddings = embeddings.detach()
-            embeddings = embeddings.cpu()
+            embeddings = embeddings.cpu().to(torch.float32)
 
+        if convert_to_numpy:
+            return embeddings.numpy()
         return embeddings
 
     def _text_length(self, text: Union[List[int], List[List[int]]]):

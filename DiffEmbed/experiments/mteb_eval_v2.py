@@ -127,6 +127,32 @@ DOC_ENCODING_PRESETS = {
         "doc_softmax_temperature": 1.0,
         "disable_chunking_for_short_docs": False,
     },
+    "chunk512_lmk_nooverlap": {
+        "doc_chunk_size": 512,
+        "doc_chunk_overlap": 0,
+        "doc_agg_mode": "lmk_mean",
+        "doc_top_k": 3,
+        "doc_softmax_temperature": 1.0,
+        "disable_chunking_for_short_docs": False,
+    },
+    "chunk1024_lmk_nooverlap": {
+        "doc_chunk_size": 1024,
+        "doc_chunk_overlap": 0,
+        "doc_agg_mode": "lmk_mean",
+        "doc_top_k": 3,
+        "doc_softmax_temperature": 1.0,
+        "disable_chunking_for_short_docs": False,
+    },
+    "chunk1024_nooverlap_token_reset_mean": {
+        "doc_chunk_size": 1024,
+        "doc_chunk_overlap": 0,
+        "doc_agg_mode": "mean",
+        "doc_top_k": 3,
+        "doc_softmax_temperature": 1.0,
+        "disable_chunking_for_short_docs": False,
+        "dice_position_mode": "reset",
+        "dice_chunk_input_mode": "token_ids",
+    },
 }
 
 
@@ -181,7 +207,7 @@ def parse_args():
     )
     parser.add_argument(
         "--doc_agg_mode",
-        choices=["mean", "max", "norm_topk_mean", "norm_softmax_mean"],
+        choices=["mean", "max", "norm_topk_mean", "norm_softmax_mean", "lmk_mean"],
         default=None,
         help="Optional override for document chunk aggregation mode.",
     )
@@ -201,6 +227,23 @@ def parse_args():
         "--disable_chunking_for_short_docs",
         action="store_true",
         help="If set, short documents stay on the single-vector path even when chunking is enabled.",
+    )
+    parser.add_argument(
+        "--dice_position_mode",
+        choices=["reset", "absolute_offset"],
+        default=None,
+        help="DICE chunk position-id ablation.",
+    )
+    parser.add_argument(
+        "--dice_chunk_input_mode",
+        choices=["text", "token_ids"],
+        default=None,
+        help="Whether DICE chunks are decoded text chunks or direct token-id slices.",
+    )
+    parser.add_argument(
+        "--longembed_local_dir",
+        default=None,
+        help="Optional local path for a manually downloaded dwzhu/LongEmbed dataset clone.",
     )
     return parser.parse_args()
 
@@ -268,6 +311,52 @@ def load_official_mteb():
             f"{'.'.join(map(str, MIN_RECOMMENDED_MTEB_VERSION))}."
         )
     return mteb, installed_version
+
+
+def patch_mteb_cached_lemb_configs() -> bool:
+    """Force cached LEMB retrieval datasets to use corpus/qrels/queries configs.
+
+    Some MTEB versions may initialize cached LEMB retrieval tasks with the
+    `default` config even when the local cache is organized under the standard
+    retrieval configs. This patch only affects cached `mteb/LEMB*` tasks.
+    """
+    try:
+        from mteb.abstasks import retrieval_dataset_loaders
+    except Exception:
+        return False
+
+    loader_cls = getattr(retrieval_dataset_loaders, "RetrievalDatasetLoader", None)
+    if loader_cls is None or getattr(loader_cls, "_diffembed_lemb_cache_patch", False):
+        return False
+
+    original_init = loader_cls.__init__
+
+    def patched_init(
+        self,
+        hf_repo: str,
+        revision: str,
+        trust_remote_code: bool = False,
+        split: str = "test",
+        config: str | None = None,
+    ):
+        original_init(
+            self,
+            hf_repo=hf_repo,
+            revision=revision,
+            trust_remote_code=trust_remote_code,
+            split=split,
+            config=config,
+        )
+        if (
+            isinstance(hf_repo, str)
+            and hf_repo.startswith("mteb/LEMB")
+            and self.dataset_configs == ["default"]
+        ):
+            self.dataset_configs = ["corpus", "qrels", "queries"]
+
+    loader_cls.__init__ = patched_init
+    loader_cls._diffembed_lemb_cache_patch = True
+    return True
 
 
 def load_llm2vec():
@@ -417,7 +506,10 @@ def load_task_to_instructions(path: str | None):
 def resolve_doc_encoding_config(mode: str) -> dict[str, Any]:
     if mode not in DOC_ENCODING_PRESETS:
         raise ValueError(f"Unknown doc encoding mode: {mode}")
-    return dict(DOC_ENCODING_PRESETS[mode])
+    config = dict(DOC_ENCODING_PRESETS[mode])
+    config.setdefault("dice_position_mode", "reset")
+    config.setdefault("dice_chunk_input_mode", "text")
+    return config
 
 
 def apply_doc_encoding_overrides(base_config: dict[str, Any], args) -> dict[str, Any]:
@@ -434,6 +526,10 @@ def apply_doc_encoding_overrides(base_config: dict[str, Any], args) -> dict[str,
         config["doc_softmax_temperature"] = args.doc_softmax_temperature
     if args.disable_chunking_for_short_docs:
         config["disable_chunking_for_short_docs"] = True
+    if args.dice_position_mode is not None:
+        config["dice_position_mode"] = args.dice_position_mode
+    if args.dice_chunk_input_mode is not None:
+        config["dice_chunk_input_mode"] = args.dice_chunk_input_mode
 
     if config["doc_chunk_size"] < 0:
         raise ValueError("doc_chunk_size must be >= 0")
@@ -445,8 +541,37 @@ def apply_doc_encoding_overrides(base_config: dict[str, Any], args) -> dict[str,
         raise ValueError("doc_top_k must be > 0")
     if config["doc_softmax_temperature"] <= 0:
         raise ValueError("doc_softmax_temperature must be > 0")
+    if config["dice_position_mode"] not in {"reset", "absolute_offset"}:
+        raise ValueError("Unknown dice_position_mode")
+    if config["dice_chunk_input_mode"] not in {"text", "token_ids"}:
+        raise ValueError("Unknown dice_chunk_input_mode")
+    if config["dice_position_mode"] == "absolute_offset" and config["dice_chunk_input_mode"] != "token_ids":
+        raise ValueError("absolute_offset currently requires dice_chunk_input_mode=token_ids")
 
     return config
+
+
+def override_local_dataset_paths(selected_tasks, longembed_local_dir: str | None) -> list[str]:
+    if not longembed_local_dir:
+        return []
+
+    local_dir = Path(longembed_local_dir).expanduser().resolve()
+    if not local_dir.exists():
+        raise FileNotFoundError(f"LongEmbed local dir does not exist: {local_dir}")
+
+    tasks = selected_tasks.tasks if hasattr(selected_tasks, "tasks") else selected_tasks
+    overridden = []
+    for task in tasks:
+        metadata = getattr(task, "metadata", None)
+        dataset = getattr(metadata, "dataset", None)
+        if not isinstance(dataset, dict):
+            continue
+        if dataset.get("path") != "dwzhu/LongEmbed":
+            continue
+        dataset["path"] = str(local_dir)
+        dataset.pop("revision", None)
+        overridden.append(getattr(metadata, "name", str(task)))
+    return overridden
 
 
 def load_bright_excluded_ids(selected_tasks, subset_name: str):
@@ -572,6 +697,8 @@ class OfficialMTEBWrapper:
         doc_top_k: int = 3,
         doc_softmax_temperature: float = 1.0,
         disable_chunking_for_short_docs: bool = False,
+        dice_position_mode: str = "reset",
+        dice_chunk_input_mode: str = "text",
     ):
         self.model = model
         self.task_to_instructions = task_to_instructions or {}
@@ -585,6 +712,8 @@ class OfficialMTEBWrapper:
         self.doc_top_k = max(1, int(doc_top_k))
         self.doc_softmax_temperature = max(float(doc_softmax_temperature), 1e-6)
         self.disable_chunking_for_short_docs = disable_chunking_for_short_docs
+        self.dice_position_mode = dice_position_mode
+        self.dice_chunk_input_mode = dice_chunk_input_mode
 
         if self.doc_chunk_overlap >= self.doc_chunk_size and self.doc_chunk_size > 0:
             raise ValueError("doc_chunk_overlap must be smaller than doc_chunk_size")
@@ -614,6 +743,10 @@ class OfficialMTEBWrapper:
         if instruction and instruction[-1] != ":":
             instruction = instruction.strip(".") + ":"
         return instruction
+
+    @staticmethod
+    def _use_safe_multi_process(task_name: str | None) -> bool:
+        return task_name == "BrightLeetcodeRetrieval"
 
     def _extract_texts(self, inputs, prompt_type=None):
         prompt_type = self._normalize_prompt_type(prompt_type)
@@ -674,6 +807,7 @@ class OfficialMTEBWrapper:
             instruction = self._format_instruction(instruction)
 
         texts = self._extract_texts(sentences, prompt_type=prompt_type)
+        self.model.use_safe_multi_process = self._use_safe_multi_process(prompt_name)
         if self._is_document_prompt(prompt_type):
             kwargs.pop("request_qid", None)
             kwargs.pop("prompt_name", None)
@@ -686,6 +820,8 @@ class OfficialMTEBWrapper:
                 top_k=self.doc_top_k,
                 softmax_temperature=self.doc_softmax_temperature,
                 disable_chunking_for_short_docs=self.disable_chunking_for_short_docs,
+                dice_position_mode=self.dice_position_mode,
+                dice_chunk_input_mode=self.dice_chunk_input_mode,
             )
 
         pairs = [[instruction, text] for text in texts]
@@ -696,6 +832,8 @@ class OfficialMTEBWrapper:
         return self.encode(queries, **kwargs)
 
     def encode_corpus(self, corpus, **kwargs):
+        current_task_name = kwargs.get("prompt_name") or kwargs.get("task_name")
+        self.model.use_safe_multi_process = self._use_safe_multi_process(current_task_name)
         texts = self._extract_texts(corpus, prompt_type="passage")
         batch_size = kwargs.pop("batch_size", 32)
         kwargs.pop("request_qid", None)
@@ -709,6 +847,8 @@ class OfficialMTEBWrapper:
             top_k=self.doc_top_k,
             softmax_temperature=self.doc_softmax_temperature,
             disable_chunking_for_short_docs=self.disable_chunking_for_short_docs,
+            dice_position_mode=self.dice_position_mode,
+            dice_chunk_input_mode=self.dice_chunk_input_mode,
         )
 
     def similarity(self, embeddings1, embeddings2):
@@ -795,6 +935,7 @@ def run_evaluation(
 def main():
     args = parse_args()
     mteb, installed_version = load_official_mteb()
+    patched_cached_lemb_configs = patch_mteb_cached_lemb_configs()
     LLM2Vec = load_llm2vec()
     ModelMeta = load_model_meta_class(mteb)
     ResultCache = load_result_cache_class(mteb)
@@ -838,9 +979,12 @@ def main():
         doc_top_k=doc_encoding_config["doc_top_k"],
         doc_softmax_temperature=doc_encoding_config["doc_softmax_temperature"],
         disable_chunking_for_short_docs=doc_encoding_config["disable_chunking_for_short_docs"],
+        dice_position_mode=doc_encoding_config["dice_position_mode"],
+        dice_chunk_input_mode=doc_encoding_config["dice_chunk_input_mode"],
     )
 
     selected_tasks = resolve_tasks(mteb, args.preset, args.task_names, args.benchmark_name)
+    overridden_local_datasets = override_local_dataset_paths(selected_tasks, args.longembed_local_dir)
     excluded_ids = load_bright_excluded_ids(selected_tasks, "leetcode")
     output_dir, prediction_dir = ensure_output_dirs(Path(args.output_dir))
 
@@ -854,8 +998,17 @@ def main():
         f"chunk_size={doc_encoding_config['doc_chunk_size']}, "
         f"chunk_overlap={doc_encoding_config['doc_chunk_overlap']}, "
         f"agg_mode={doc_encoding_config['doc_agg_mode']}, "
-        f"skip_short={doc_encoding_config['disable_chunking_for_short_docs']}"
+        f"skip_short={doc_encoding_config['disable_chunking_for_short_docs']}, "
+        f"dice_position={doc_encoding_config['dice_position_mode']}, "
+        f"dice_chunk_input={doc_encoding_config['dice_chunk_input_mode']}"
     )
+    if patched_cached_lemb_configs:
+        print("Patched cached MTEB LEMB dataset configs: corpus/qrels/queries")
+    if overridden_local_datasets:
+        print(
+            "Overrode LongEmbed dataset paths for: "
+            + ", ".join(overridden_local_datasets)
+        )
     if excluded_ids is not None:
         print("Loaded BRIGHT excluded_ids")
 
@@ -895,6 +1048,9 @@ def main():
                 "doc_top_k": doc_encoding_config["doc_top_k"],
                 "doc_softmax_temperature": doc_encoding_config["doc_softmax_temperature"],
                 "disable_chunking_for_short_docs": doc_encoding_config["disable_chunking_for_short_docs"],
+                "dice_position_mode": doc_encoding_config["dice_position_mode"],
+                "dice_chunk_input_mode": doc_encoding_config["dice_chunk_input_mode"],
+                "longembed_local_dir": args.longembed_local_dir,
             },
         )
         print(f"Summary JSON written to: {summary_path}")
