@@ -98,7 +98,3 @@ This codebase builds on ideas and implementations from:
 - [LLM2Vec](https://github.com/McGill-NLP/llm2vec/)
 - [Dream](https://github.com/HKUNLP/Dream)
 - [DiffEmbed](https://github.com/siyue-zhang/DiffEmbed)
-
-## Citation
-
-If you use this repository, cite the corresponding paper or project version you release alongside it.
